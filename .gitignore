@@ -8,7 +8,6 @@ codex2api
 
 # Go
 /vendor/
-go.sum
 
 # Frontend
 frontend/node_modules/
