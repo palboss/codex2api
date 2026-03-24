@@ -90,30 +90,32 @@ func main() {
 		log.Printf("前端静态文件加载失败（开发模式可忽略）: %v", err)
 	} else {
 		httpFS := http.FS(subFS)
+		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
+		indexHTML, _ := fs.ReadFile(subFS, "index.html")
+
 		// SPA 回退：所有 /admin/* 路径优先尝试静态文件，找不到则返回 index.html
 		r.GET("/admin/*filepath", func(c *gin.Context) {
 			fp := c.Param("filepath")
-			if fp == "/" {
-				fp = "/index.html"
-			}
-			// 尝试打开请求的文件（排除目录）
-			trimmed := fp[1:] // 去掉开头的 /
-			if f, err := subFS.Open(trimmed); err == nil {
-				fi, statErr := f.Stat()
-				f.Close()
-				if statErr == nil && !fi.IsDir() {
-					c.FileFromFS(fp, httpFS)
-					return
+			// 尝试打开请求的文件（排除目录和根路径）
+			if fp != "/" {
+				trimmed := fp[1:] // 去掉开头的 /
+				if f, err := subFS.Open(trimmed); err == nil {
+					fi, statErr := f.Stat()
+					f.Close()
+					if statErr == nil && !fi.IsDir() {
+						c.FileFromFS(fp, httpFS)
+						return
+					}
 				}
 			}
-			// 文件不存在或者是目录 → 返回 index.html（让 React Router 处理）
-			c.FileFromFS("/index.html", httpFS)
+			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
+			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		})
 	}
 
-	// 根路径重定向到管理后台
+	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）
 	r.GET("/", func(c *gin.Context) {
-		c.Redirect(http.StatusMovedPermanently, "/admin/")
+		c.Redirect(http.StatusFound, "/admin/")
 	})
 
 	// 健康检查
