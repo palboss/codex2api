@@ -425,6 +425,13 @@ func (a *Account) GetUsagePercent7d() (float64, bool) {
 	return a.UsagePercent7d, a.UsagePercent7dValid
 }
 
+// GetPlanType 获取账号套餐类型
+func (a *Account) GetPlanType() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.PlanType
+}
+
 // GetHealthTier 获取当前健康层级
 func (a *Account) GetHealthTier() string {
 	a.mu.RLock()
@@ -1061,6 +1068,9 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	acc.SuccessStreak = 0
 
 	switch kind {
+	case "unauthorized":
+		acc.LastUnauthorizedAt = now
+		acc.HealthTier = HealthTierBanned
 	case "timeout":
 		acc.LastTimeoutAt = now
 		if acc.HealthTier == HealthTierHealthy {

@@ -128,8 +128,10 @@ func classifyTransportFailure(err error) string {
 
 func classifyHTTPFailure(statusCode int) string {
 	switch {
-	case statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests:
-		return ""
+	case statusCode == http.StatusUnauthorized:
+		return "unauthorized"
+	case statusCode == http.StatusTooManyRequests:
+		return "" // 429 由 applyCooldown 单独处理
 	case statusCode >= 500:
 		return "server"
 	case statusCode >= 400:
@@ -306,7 +308,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody)
+			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
@@ -522,7 +524,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody)
+			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
@@ -769,20 +771,89 @@ func parseRetryAfter(body []byte) time.Duration {
 }
 
 // applyCooldown 根据上游状态码设置智能冷却
-func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []byte) {
+func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []byte, resp *http.Response) {
 	switch statusCode {
 	case http.StatusTooManyRequests:
-		cooldown := parseRetryAfter(body)
-		if cooldown < 30*time.Second {
-			cooldown = 30 * time.Second
-		}
-		if cooldown > 15*time.Minute {
-			cooldown = 15 * time.Minute
-		}
-		log.Printf("账号 %d 被限速，冷却 %v", account.ID(), cooldown)
+		cooldown := h.compute429Cooldown(account, body, resp)
+		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), cooldown)
 		h.store.MarkCooldown(account, cooldown, "rate_limited")
 	case http.StatusUnauthorized:
 		h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+	}
+}
+
+// compute429Cooldown 根据计划类型和 Codex 响应精确计算 429 冷却时间
+func (h *Handler) compute429Cooldown(account *auth.Account, body []byte, resp *http.Response) time.Duration {
+	// 1. 优先使用 Codex 响应体中的精确重置时间
+	if resetDuration := parseRetryAfter(body); resetDuration > 2*time.Minute {
+		// parseRetryAfter 默认返回 2min（无数据），超过 2min 说明解析到了真实的 resets_at/resets_in_seconds
+		if resetDuration > 7*24*time.Hour {
+			resetDuration = 7 * 24 * time.Hour // 最多 7 天
+		}
+		return resetDuration
+	}
+
+	// 2. 没有精确重置时间，根据套餐类型 + 用量窗口推断
+	planType := strings.ToLower(account.GetPlanType())
+
+	switch planType {
+	case "free":
+		// Free 只有 7d 窗口，429 = 额度耗尽，冷却 7 天
+		return 7 * 24 * time.Hour
+
+	case "team", "pro", "enterprise":
+		// Team/Pro 有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
+		return h.detectTeamCooldownWindow(resp)
+
+	default:
+		// 未知套餐，保守默认 5 小时
+		return 5 * time.Hour
+	}
+}
+
+// detectTeamCooldownWindow 通过响应头判断 Team/Pro 账号是哪个窗口触发的限制
+func (h *Handler) detectTeamCooldownWindow(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 5 * time.Hour // 保守默认
+	}
+
+	// Codex 返回两组窗口头：primary 和 secondary
+	// x-codex-primary-window-minutes / x-codex-primary-used-percent
+	// x-codex-secondary-window-minutes / x-codex-secondary-used-percent
+	// 用量 >= 100% 的窗口就是触发限制的窗口
+
+	primaryUsed := parseFloat(resp.Header.Get("x-codex-primary-used-percent"))
+	primaryWindowMin := parseFloat(resp.Header.Get("x-codex-primary-window-minutes"))
+	secondaryUsed := parseFloat(resp.Header.Get("x-codex-secondary-used-percent"))
+	secondaryWindowMin := parseFloat(resp.Header.Get("x-codex-secondary-window-minutes"))
+
+	// 找到 used >= 100% 的窗口
+	primaryExhausted := primaryUsed >= 100
+	secondaryExhausted := secondaryUsed >= 100
+
+	switch {
+	case primaryExhausted && secondaryExhausted:
+		// 两个窗口都满了，取较大窗口的冷却时间
+		return windowMinutesToCooldown(max(primaryWindowMin, secondaryWindowMin))
+	case primaryExhausted:
+		return windowMinutesToCooldown(primaryWindowMin)
+	case secondaryExhausted:
+		return windowMinutesToCooldown(secondaryWindowMin)
+	default:
+		// 都没满但还是 429，可能是短时 burst 限制
+		return 5 * time.Hour
+	}
+}
+
+// windowMinutesToCooldown 根据窗口分钟数决定冷却时长
+func windowMinutesToCooldown(windowMinutes float64) time.Duration {
+	switch {
+	case windowMinutes >= 1440: // >= 1 天 → 7d 窗口
+		return 7 * 24 * time.Hour
+	case windowMinutes >= 60: // >= 1 小时 → 5h 窗口
+		return 5 * time.Hour
+	default:
+		return 30 * time.Minute // 短窗口
 	}
 }
 
@@ -858,7 +929,7 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 
 // handleUpstreamError 统一处理上游错误（兼容旧调用）
 func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, statusCode int, body []byte) {
-	h.applyCooldown(account, statusCode, body)
+	h.applyCooldown(account, statusCode, body, nil)
 	h.sendUpstreamError(c, statusCode, body)
 }
 
