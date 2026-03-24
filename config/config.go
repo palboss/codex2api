@@ -4,25 +4,18 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/joho/godotenv"
 )
 
-// AccountConfig 单个 Codex 账号配置（环境变量/YAML 直接导入用）
-type AccountConfig struct {
-	RefreshToken string `yaml:"refresh_token"`
-	ProxyURL     string `yaml:"proxy_url"`
-}
-
-// DatabaseConfig PostgreSQL 配置
+// DatabaseConfig PostgreSQL 核心配置
 type DatabaseConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	DBName   string `yaml:"dbname"`
-	SSLMode  string `yaml:"sslmode"`
+	Host     string
+	Port     int
+	User     string
+	Password string
+	DBName   string
+	SSLMode  string
 }
 
 // DSN 返回 PostgreSQL 连接字符串
@@ -35,121 +28,64 @@ func (d *DatabaseConfig) DSN() string {
 		d.Host, d.Port, d.User, d.Password, d.DBName, sslMode)
 }
 
-// RedisConfig Redis 配置
+// RedisConfig Redis 核心配置
 type RedisConfig struct {
-	Addr     string `yaml:"addr"`
-	Password string `yaml:"password"`
-	DB       int    `yaml:"db"`
+	Addr     string
+	Password string
+	DB       int
 }
 
-// Config 全局配置
+// Config 全局核心环境配置（物理隔离的服务器参数）
+// 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port            int             `yaml:"port"`
-	APIKeys         []string        `yaml:"api_keys"`
-	ProxyURL        string          `yaml:"proxy_url"`
-	MaxConcurrency  int             `yaml:"max_concurrency"`  // 每账号最大并发数，默认 2
-	GlobalRPM       int             `yaml:"global_rpm"`       // 全局 RPM 限制，0 = 不限制
-	TestModel       string          `yaml:"test_model"`       // 测试连接使用的模型，默认 gpt-5.4
-	TestConcurrency int             `yaml:"test_concurrency"` // 批量测试并发数，默认 50
-	Database        DatabaseConfig  `yaml:"database"`
-	Redis           RedisConfig     `yaml:"redis"`
-	Accounts        []AccountConfig `yaml:"accounts"` // 可选：首次启动时通过 YAML/环境变量导入 RT 到数据库
+	Port     int
+	Database DatabaseConfig
+	Redis    RedisConfig
 }
 
-// Load 从 YAML 文件加载配置，环境变量覆盖
-func Load(path string) (*Config, error) {
+// Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
+func Load(envPath string) (*Config, error) {
+	// 尝试加载 .env 文件（可选，如果文件不存在则忽略并使用当前环境变量）
+	if envPath == "" {
+		envPath = ".env"
+	}
+	_ = godotenv.Load(envPath) 
+
 	cfg := &Config{Port: 8080}
 
-	// 尝试从文件加载
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("读取配置文件失败: %w", err)
-			}
-		} else {
-			if err := yaml.Unmarshal(data, cfg); err != nil {
-				return nil, fmt.Errorf("解析配置文件失败: %w", err)
-			}
-		}
-	}
-
-	// 环境变量覆盖
+	// Web服务端口
 	if port := os.Getenv("CODEX_PORT"); port != "" {
 		fmt.Sscanf(port, "%d", &cfg.Port)
-	}
-	if proxy := os.Getenv("CODEX_PROXY_URL"); proxy != "" {
-		cfg.ProxyURL = proxy
-	}
-	if keys := os.Getenv("CODEX_API_KEYS"); keys != "" {
-		cfg.APIKeys = strings.Split(keys, ",")
+	} else if port := os.Getenv("PORT"); port != "" {
+		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 
-	// 环境变量覆盖 Database 配置
-	if dsn := os.Getenv("DATABASE_HOST"); dsn != "" {
-		cfg.Database.Host = dsn
-	}
+	// 数据库配置
+	cfg.Database.Host = os.Getenv("DATABASE_HOST")
 	if v := os.Getenv("DATABASE_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Database.Port = p
 		}
 	}
-	if v := os.Getenv("DATABASE_USER"); v != "" {
-		cfg.Database.User = v
-	}
-	if v := os.Getenv("DATABASE_PASSWORD"); v != "" {
-		cfg.Database.Password = v
-	}
-	if v := os.Getenv("DATABASE_NAME"); v != "" {
-		cfg.Database.DBName = v
+	cfg.Database.User = os.Getenv("DATABASE_USER")
+	cfg.Database.Password = os.Getenv("DATABASE_PASSWORD")
+	cfg.Database.DBName = os.Getenv("DATABASE_NAME")
+	if v := os.Getenv("DATABASE_SSLMODE"); v != "" {
+		cfg.Database.SSLMode = v
 	}
 
-	// 环境变量覆盖 Redis 配置
-	if v := os.Getenv("REDIS_ADDR"); v != "" {
-		cfg.Redis.Addr = v
-	}
-	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
-		cfg.Redis.Password = v
-	}
+	// Redis配置
+	cfg.Redis.Addr = os.Getenv("REDIS_ADDR")
+	cfg.Redis.Password = os.Getenv("REDIS_PASSWORD")
 	if v := os.Getenv("REDIS_DB"); v != "" {
 		if db, err := strconv.Atoi(v); err == nil {
 			cfg.Redis.DB = db
 		}
 	}
 
-	// 从环境变量加载 RT 列表（逗号分隔）— 向后兼容 v1
-	if rts := os.Getenv("CODEX_REFRESH_TOKENS"); rts != "" {
-		for _, rt := range strings.Split(rts, ",") {
-			rt = strings.TrimSpace(rt)
-			if rt != "" {
-				cfg.Accounts = append(cfg.Accounts, AccountConfig{RefreshToken: rt})
-			}
-		}
-	}
-
-	// 限流配置环境变量覆盖
-	if v := os.Getenv("CODEX_MAX_CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.MaxConcurrency = n
-		}
-	}
-	if v := os.Getenv("CODEX_GLOBAL_RPM"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.GlobalRPM = n
-		}
-	}
-	if v := os.Getenv("CODEX_TEST_MODEL"); v != "" {
-		cfg.TestModel = v
-	}
-	if v := os.Getenv("CODEX_TEST_CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.TestConcurrency = n
-		}
-	}
-
-	// 校验必需配置
+	// 校验必填物理层配置
 	if cfg.Database.Host == "" {
-		return nil, fmt.Errorf("必须配置 PostgreSQL (database.host 或 DATABASE_HOST)")
+		return nil, fmt.Errorf("必须通过 .env 或环境变量配置 PostgreSQL (DATABASE_HOST)")
 	}
 	if cfg.Database.Port == 0 {
 		cfg.Database.Port = 5432
@@ -158,18 +94,7 @@ func Load(path string) (*Config, error) {
 		cfg.Database.SSLMode = "disable"
 	}
 	if cfg.Redis.Addr == "" {
-		return nil, fmt.Errorf("必须配置 Redis (redis.addr 或 REDIS_ADDR)")
-	}
-
-	// 限流默认值
-	if cfg.MaxConcurrency <= 0 {
-		cfg.MaxConcurrency = 2
-	}
-	if cfg.TestModel == "" {
-		cfg.TestModel = "gpt-5.4"
-	}
-	if cfg.TestConcurrency <= 0 {
-		cfg.TestConcurrency = 50
+		return nil, fmt.Errorf("必须通过 .env 或环境变量配置 Redis (REDIS_ADDR)")
 	}
 
 	return cfg, nil

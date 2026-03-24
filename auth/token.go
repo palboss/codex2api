@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/codex2api/config"
 )
 
 // OpenAI OAuth 常量（与 CLIProxyAPI / sub2api 一致）
@@ -221,14 +219,7 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	return client
 }
 
-// BuildHTTPClientFromConfig 从账号配置构建 HTTP 客户端
-func BuildHTTPClientFromConfig(account *config.AccountConfig, globalProxy string) *http.Client {
-	proxy := account.ProxyURL
-	if proxy == "" {
-		proxy = globalProxy
-	}
-	return buildHTTPClient(proxy)
-}
+
 
 // HashAccountID 从 account_id 生成短哈希（用于日志）
 func HashAccountID(accountID string) string {

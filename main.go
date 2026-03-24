@@ -28,16 +28,12 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
 
-	// 1. 加载配置
-	cfgPath := "config.yaml"
-	if p := os.Getenv("CODEX_CONFIG"); p != "" {
-		cfgPath = p
-	}
-	cfg, err := config.Load(cfgPath)
+	// 1. 加载配置 (.env)
+	cfg, err := config.Load(".env")
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
-	log.Printf("配置加载成功: port=%d", cfg.Port)
+	log.Printf("物理层配置加载成功: port=%d", cfg.Port)
 
 	// 2. 初始化 PostgreSQL
 	db, err := database.New(cfg.Database.DSN())
@@ -55,18 +51,41 @@ func main() {
 	defer tc.Close()
 	log.Printf("Redis 连接成功: %s", cfg.Redis.Addr)
 
-	// 4. 初始化账号管理器
-	store := auth.NewStore(cfg, db, tc)
+	// 4. 读取运行时的系统逻辑设置
+	sysCtx, sysCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	settings, err := db.GetSystemSettings(sysCtx)
+	sysCancel()
+
+	if err == nil && settings == nil {
+		// 初次运行，保存初始安全设置到数据库
+		log.Printf("初次运行，初始化系统默认设置...")
+		settings = &database.SystemSettings{
+			MaxConcurrency:  2,
+			GlobalRPM:       0,
+			TestModel:       "gpt-5.4",
+			TestConcurrency: 50,
+			ProxyURL:        "",
+		}
+		_ = db.UpdateSystemSettings(context.Background(), settings)
+	} else if err != nil {
+		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
+		settings = &database.SystemSettings{MaxConcurrency: 2, GlobalRPM: 0, TestModel: "gpt-5.4", TestConcurrency: 50}
+	} else {
+		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d", settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM)
+	}
+
+	// 5. 初始化账号管理器
+	store := auth.NewStore(db, tc, settings)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	if err := store.Init(ctx, cfg); err != nil {
+	if err := store.Init(ctx); err != nil {
 		cancel()
 		log.Fatalf("账号初始化失败: %v", err)
 	}
 	cancel()
 
-	// 全局 RPM 限流器（支持运行时动态调整）
-	rateLimiter := proxy.NewRateLimiter(cfg.GlobalRPM)
+	// 全局 RPM 限流器
+	rateLimiter := proxy.NewRateLimiter(settings.GlobalRPM)
 	adminHandler := admin.NewHandler(store, db, tc, rateLimiter)
 	store.SetUsageProbeFunc(adminHandler.ProbeUsageSnapshot)
 
@@ -77,19 +96,20 @@ func main() {
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 
-	// 5. 启动 HTTP 服务
+	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(loggerMiddleware())
 
-	handler := proxy.NewHandler(store, cfg.APIKeys, db)
+	// handler 不再接收 cfg.APIKeys
+	handler := proxy.NewHandler(store, db)
 
 	r.Use(rateLimiter.Middleware())
-	if cfg.GlobalRPM > 0 {
-		log.Printf("全局限流: %d RPM", cfg.GlobalRPM)
+	if settings.GlobalRPM > 0 {
+		log.Printf("全局限流已生效: %d RPM", settings.GlobalRPM)
 	}
-	log.Printf("每账号并发上限: %d", cfg.MaxConcurrency)
+	log.Printf("单账号并发上限: %d", settings.MaxConcurrency)
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterRoutes(r)

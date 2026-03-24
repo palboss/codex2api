@@ -205,6 +205,15 @@ func (db *DB) migrate(ctx context.Context) error {
 		key        VARCHAR(255) NOT NULL UNIQUE,
 		created_at TIMESTAMP DEFAULT NOW()
 	);
+
+	CREATE TABLE IF NOT EXISTS system_settings (
+		id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+		max_concurrency    INT DEFAULT 2,
+		global_rpm         INT DEFAULT 0,
+		test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
+		test_concurrency   INT DEFAULT 50,
+		proxy_url          VARCHAR(500) DEFAULT ''
+	);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	return err
@@ -245,6 +254,40 @@ func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error)
 	err := db.conn.QueryRowContext(ctx,
 		`INSERT INTO api_keys (name, key) VALUES ($1, $2) RETURNING id`, name, key).Scan(&id)
 	return id, err
+}
+
+// ==================== System Settings ====================
+
+// SystemSettings 运行时设置项
+type SystemSettings struct {
+	MaxConcurrency  int
+	GlobalRPM       int
+	TestModel       string
+	TestConcurrency int
+	ProxyURL        string
+}
+
+// GetSystemSettings 加载全局设置
+func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
+	s := &SystemSettings{}
+	err := db.conn.QueryRowContext(ctx, `
+		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url
+		FROM system_settings WHERE id = 1
+	`).Scan(&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return s, err
+}
+
+// UpdateSystemSettings 更新全局设置
+func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
+	_, err := db.conn.ExecContext(ctx, `
+		UPDATE system_settings
+		SET max_concurrency = $1, global_rpm = $2, test_model = $3, test_concurrency = $4, proxy_url = $5
+		WHERE id = 1
+	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL)
+	return err
 }
 
 // DeleteAPIKey 删除 API 密钥

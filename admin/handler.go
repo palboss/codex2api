@@ -449,6 +449,7 @@ type settingsResponse struct {
 	GlobalRPM       int    `json:"global_rpm"`
 	TestModel       string `json:"test_model"`
 	TestConcurrency int    `json:"test_concurrency"`
+	ProxyURL        string `json:"proxy_url"`
 }
 
 type updateSettingsReq struct {
@@ -456,6 +457,7 @@ type updateSettingsReq struct {
 	GlobalRPM       *int    `json:"global_rpm"`
 	TestModel       *string `json:"test_model"`
 	TestConcurrency *int    `json:"test_concurrency"`
+	ProxyURL        *string `json:"proxy_url"`
 }
 
 // GetSettings 获取当前系统设置
@@ -465,6 +467,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		GlobalRPM:       h.rateLimiter.GetRPM(),
 		TestModel:       h.store.GetTestModel(),
 		TestConcurrency: h.store.GetTestConcurrency(),
+		ProxyURL:        h.store.GetProxyURL(),
 	})
 }
 
@@ -514,11 +517,29 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: test_concurrency = %d", v)
 	}
 
+	if req.ProxyURL != nil {
+		h.store.SetProxyURL(*req.ProxyURL)
+		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
+	}
+
+	// 持久化保存到数据库
+	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+		MaxConcurrency:  h.store.GetMaxConcurrency(),
+		GlobalRPM:       h.rateLimiter.GetRPM(),
+		TestModel:       h.store.GetTestModel(),
+		TestConcurrency: h.store.GetTestConcurrency(),
+		ProxyURL:        h.store.GetProxyURL(),
+	})
+	if err != nil {
+		log.Printf("无法持久化保存设置: %v", err)
+	}
+
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:  h.store.GetMaxConcurrency(),
 		GlobalRPM:       h.rateLimiter.GetRPM(),
 		TestModel:       h.store.GetTestModel(),
 		TestConcurrency: h.store.GetTestConcurrency(),
+		ProxyURL:        h.store.GetProxyURL(),
 	})
 }
 

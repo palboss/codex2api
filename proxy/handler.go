@@ -31,15 +31,12 @@ type Handler struct {
 }
 
 // NewHandler 创建处理器
-func NewHandler(store *auth.Store, apiKeys []string, db *database.DB) *Handler {
-	keyMap := make(map[string]bool)
-	for _, k := range apiKeys {
-		k = strings.TrimSpace(k)
-		if k != "" {
-			keyMap[k] = true
-		}
+func NewHandler(store *auth.Store, db *database.DB) *Handler {
+	return &Handler{
+		store:      store,
+		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
+		db:         db,
 	}
-	return &Handler{store: store, configKeys: keyMap, db: db}
 }
 
 // refreshDBKeys 从数据库刷新密钥缓存（5 分钟）

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/codex2api/cache"
-	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 )
 
@@ -239,39 +238,44 @@ type Store struct {
 }
 
 // NewStore 创建账号管理器
-func NewStore(cfg *config.Config, db *database.DB, tc *cache.TokenCache) *Store {
+func NewStore(db *database.DB, tc *cache.TokenCache, settings *database.SystemSettings) *Store {
+	if settings == nil {
+		settings = &database.SystemSettings{
+			MaxConcurrency:  2,
+			TestConcurrency: 50,
+			TestModel:       "gpt-5.4",
+			ProxyURL:        "",
+		}
+	}
 	s := &Store{
-		globalProxy:     cfg.ProxyURL,
-		maxConcurrency:  int64(cfg.MaxConcurrency),
-		testConcurrency: int64(cfg.TestConcurrency),
+		globalProxy:     settings.ProxyURL,
+		maxConcurrency:  int64(settings.MaxConcurrency),
+		testConcurrency: int64(settings.TestConcurrency),
 		db:              db,
 		tokenCache:      tc,
 		stopCh:          make(chan struct{}),
 	}
-	s.testModel.Store(cfg.TestModel)
+	s.testModel.Store(settings.TestModel)
 	return s
 }
 
-// Init 初始化：从 PG 加载账号
-func (s *Store) Init(ctx context.Context, cfg *config.Config) error {
-	// 1. 把配置文件/环境变量中的 RT 导入数据库（首次启动用）
-	if len(cfg.Accounts) > 0 {
-		count, _ := s.db.CountAll(ctx)
-		if count == 0 {
-			log.Println("数据库为空，导入配置中的账号...")
-			for i, ac := range cfg.Accounts {
-				name := fmt.Sprintf("account-%d", i+1)
-				id, err := s.db.InsertAccount(ctx, name, ac.RefreshToken, ac.ProxyURL)
-				if err != nil {
-					log.Printf("[账号 %d] 导入失败: %v", i+1, err)
-				} else {
-					log.Printf("[账号 %d] 导入成功: id=%d", i+1, id)
-				}
-			}
-		}
-	}
+// GetProxyURL 获取全局代理地址
+func (s *Store) GetProxyURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.globalProxy
+}
 
-	// 2. 从 PG 加载账号
+// SetProxyURL 更新全局代理地址
+func (s *Store) SetProxyURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.globalProxy = url
+}
+
+// Init 初始化：从 PG 加载账号
+func (s *Store) Init(ctx context.Context) error {
+	// 1. 从 PG 加载账号
 	if err := s.loadFromDB(ctx); err != nil {
 		return err
 	}
@@ -281,7 +285,7 @@ func (s *Store) Init(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 
-	// 3. 并行刷新所有账号的 AT
+	// 2. 并行刷新所有账号的 AT
 	s.parallelRefreshAll(ctx)
 
 	successCount := 0

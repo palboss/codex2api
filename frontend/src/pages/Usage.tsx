@@ -52,6 +52,13 @@ function formatTime(iso: string): string {
   }
 }
 
+function getStatusBadgeVariant(statusCode: number): 'default' | 'secondary' | 'destructive' {
+  if (statusCode === 200) return 'default'
+  if (statusCode === 401) return 'destructive'
+  if (statusCode === 429) return 'secondary'
+  return statusCode < 400 ? 'default' : statusCode < 500 ? 'secondary' : 'destructive'
+}
+
 export default function Usage() {
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
@@ -269,7 +276,7 @@ export default function Usage() {
                       <TableRow key={log.id}>
                         <TableCell>
                           <Badge
-                            variant={log.status_code < 400 ? 'default' : log.status_code < 500 ? 'secondary' : 'destructive'}
+                            variant={getStatusBadgeVariant(log.status_code)}
                             className="text-[14px]"
                           >
                             {log.status_code}
