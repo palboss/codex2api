@@ -545,6 +545,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		COUNT(*)    FILTER (WHERE status_code >= 400)                AS today_errors
 	FROM usage_logs
 	WHERE created_at >= CURRENT_DATE
+	  AND status_code <> 499
 	`
 
 	var todayErrors int64
@@ -558,11 +559,11 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		return nil, err
 	}
 
-	// 用 pg_class.reltuples 快速获取近似总行数（不扫描表，瞬时返回）
-	var approxTotal int64
+	// 统计当前可见请求总数（排除 499，保证与使用统计列表口径一致）
+	var visibleTotal int64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COALESCE(reltuples::bigint, 0) FROM pg_class WHERE relname = 'usage_logs'
-	`).Scan(&approxTotal)
+		SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499
+	`).Scan(&visibleTotal)
 
 	// 加上基线值（清空日志前保存的累计值）
 	var bReq, bTok, bPrompt, bComp, bCached int64
@@ -571,7 +572,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		FROM usage_stats_baseline WHERE id = 1
 	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
 
-	stats.TotalRequests = approxTotal + bReq
+	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = stats.TodayTokens + bTok
 	stats.TotalPrompt += bPrompt
 	stats.TotalCompletion += bComp
@@ -637,6 +638,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(a.credentials->>'email', ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
+	           WHERE u.status_code <> 499
 	           ORDER BY u.id DESC LIMIT $1`
 	rows, err := db.conn.QueryContext(ctx, query, limit)
 	if err != nil {
@@ -705,6 +707,7 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens
 	FROM usage_logs
 	WHERE created_at >= $1 AND created_at <= $2
+	  AND status_code <> 499
 	GROUP BY 1
 	ORDER BY 1`
 
@@ -733,6 +736,7 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 	SELECT COALESCE(model, 'unknown'), COUNT(*) AS requests
 	FROM usage_logs
 	WHERE created_at >= $1 AND created_at <= $2
+	  AND status_code <> 499
 	GROUP BY 1
 	ORDER BY 2 DESC
 	LIMIT 10`
@@ -767,6 +771,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
+	             AND u.status_code <> 499
 	           ORDER BY u.created_at ASC`
 	rows, err := db.conn.QueryContext(ctx, query, start, end)
 	if err != nil {
@@ -812,6 +817,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, start, end time
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
+	             AND u.status_code <> 499
 	           ORDER BY u.created_at DESC
 	           LIMIT $3 OFFSET $4`
 	rows, err := db.conn.QueryContext(ctx, query, start, end, pageSize, offset)
@@ -841,11 +847,11 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	// 先将当前日志的累计值叠加到基线表
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE usage_stats_baseline SET
-			total_requests  = total_requests  + COALESCE((SELECT COUNT(*) FROM usage_logs), 0),
-			total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs), 0),
-			prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs), 0),
-			completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs), 0),
-			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs), 0)
+			total_requests  = total_requests  + COALESCE((SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499), 0),
+			total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0)
 		WHERE id = 1
 	`)
 	if err != nil {

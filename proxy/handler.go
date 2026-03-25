@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -141,6 +142,55 @@ func classifyHTTPFailure(statusCode int) string {
 	}
 }
 
+type streamOutcome struct {
+	logStatusCode  int
+	failureKind    string
+	failureMessage string
+	penalize       bool
+}
+
+func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) streamOutcome {
+	if gotTerminal {
+		return streamOutcome{logStatusCode: http.StatusOK}
+	}
+
+	if ctxErr != nil || writeErr != nil {
+		msg := "下游客户端提前断开"
+		switch {
+		case errors.Is(ctxErr, context.DeadlineExceeded):
+			msg = "下游请求上下文超时"
+		case writeErr != nil:
+			msg = fmt.Sprintf("写回下游失败: %v", writeErr)
+		case ctxErr != nil:
+			msg = fmt.Sprintf("下游请求提前取消: %v", ctxErr)
+		}
+		return streamOutcome{
+			logStatusCode:  logStatusClientClosed,
+			failureMessage: msg,
+		}
+	}
+
+	if readErr != nil {
+		kind := classifyTransportFailure(readErr)
+		if kind == "" {
+			kind = "transport"
+		}
+		return streamOutcome{
+			logStatusCode:  logStatusUpstreamStreamBreak,
+			failureKind:    kind,
+			failureMessage: fmt.Sprintf("上游流读取失败: %v", readErr),
+			penalize:       true,
+		}
+	}
+
+	return streamOutcome{
+		logStatusCode:  logStatusUpstreamStreamBreak,
+		failureKind:    "transport",
+		failureMessage: "上游流提前结束，未收到终止事件",
+		penalize:       true,
+	}
+}
+
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1 := r.Group("/v1")
@@ -191,6 +241,11 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 // ==================== /v1/responses ====================
 
 const maxRetries = 2 // 最多重试次数（换号）
+
+const (
+	logStatusClientClosed        = 499
+	logStatusUpstreamStreamBreak = 598
+)
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
@@ -273,7 +328,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		resp, reqErr := ExecuteRequest(account, codexBody, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -325,8 +380,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false
-		gotTerminal := false    // 是否收到 response.completed 或 response.failed
-		deltaCharCount := 0    // 累计 delta 字符数（用于断流时估算 token）
+		gotTerminal := false // 是否收到 response.completed 或 response.failed
+		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
+		var readErr error
+		var writeErr error
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -345,7 +402,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 
-			_ = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
@@ -368,14 +425,17 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+					writeErr = err
+					return false
+				}
 				flusher.Flush()
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
-			_ = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -417,10 +477,10 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
-		logStatusCode := 200
-		if !gotTerminal && usage == nil {
-			logStatusCode = 499 // 标记为异常断流
-			log.Printf("流提前断开 (account %d, /v1/responses): 未收到 response.completed, 已转发约 %d 字符", account.ID(), deltaCharCount)
+		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		logStatusCode := outcome.logStatusCode
+		if outcome.logStatusCode != http.StatusOK {
+			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
 				if estOutputTokens < 1 {
@@ -461,7 +521,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
-		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		if outcome.penalize {
+			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		} else if outcome.logStatusCode == http.StatusOK {
+			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.store.Release(account)
 		return
 	}
@@ -523,7 +587,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		resp, reqErr := ExecuteRequest(account, codexBody, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -575,8 +639,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false
-		gotTerminal := false    // 是否收到 response.completed 或 response.failed
-		deltaCharCount := 0    // 累计 delta 字符数（用于断流时估算 token）
+		gotTerminal := false // 是否收到 response.completed 或 response.failed
+		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
+		var readErr error
+		var writeErr error
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
@@ -597,7 +663,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return
 			}
 
-			_ = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				chunk, done := TranslateStreamChunk(data, model, chunkID)
 
 				eventType := gjson.GetBytes(data, "type").String()
@@ -619,11 +685,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 				if chunk != nil {
 					chunk, _ = sjson.SetBytes(chunk, "created", created)
-					fmt.Fprintf(c.Writer, "data: %s\n\n", chunk)
+					if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", chunk); err != nil {
+						writeErr = err
+						return false
+					}
 					flusher.Flush()
 				}
 				if done {
-					fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+					if _, err := fmt.Fprintf(c.Writer, "data: [DONE]\n\n"); err != nil {
+						writeErr = err
+						return false
+					}
 					flusher.Flush()
 					return false
 				}
@@ -632,7 +704,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		} else {
 			var fullContent strings.Builder
 
-			_ = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -674,10 +746,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
-		logStatusCode := 200
-		if !gotTerminal && usage == nil {
-			logStatusCode = 499 // 标记为异常断流
-			log.Printf("流提前断开 (account %d, /v1/chat/completions): 未收到 response.completed, 已转发约 %d 字符", account.ID(), deltaCharCount)
+		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		logStatusCode := outcome.logStatusCode
+		if outcome.logStatusCode != http.StatusOK {
+			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {
@@ -718,7 +790,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
-		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		if outcome.penalize {
+			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		} else if outcome.logStatusCode == http.StatusOK {
+			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.store.Release(account)
 		return
 	}

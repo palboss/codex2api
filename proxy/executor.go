@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -56,7 +57,9 @@ func getPooledClient(proxyURL string) *http.Client {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Minute, // 流式请求需要较长超时
+		// 流式响应不能使用 Client.Timeout，否则长时间生成会被整条链路硬切断。
+		// 取消控制改由请求 context 和底层连接超时完成。
+		Timeout: 0,
 	}
 
 	// CAS 存储，确保相同 proxyURL 只创建一个 Client
@@ -76,7 +79,11 @@ const (
 
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
-func ExecuteRequest(account *auth.Account, requestBody []byte, sessionID string) (*http.Response, error) {
+func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	account.Mu().RLock()
 	accessToken := account.AccessToken
 	accountID := account.AccountID
@@ -111,7 +118,7 @@ func ExecuteRequest(account *auth.Account, requestBody []byte, sessionID string)
 
 	endpoint := CodexBaseURL + "/responses"
 
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
@@ -177,6 +184,20 @@ func ResolveSessionID(authHeader string, body []byte) string {
 func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 	buf := make([]byte, 4096)
 	var lineBuf []byte
+	var dataLines [][]byte
+
+	emitEvent := func() bool {
+		if len(dataLines) == 0 {
+			return true
+		}
+
+		data := bytes.Join(dataLines, []byte("\n"))
+		dataLines = dataLines[:0]
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return false
+		}
+		return callback(data)
+	}
 
 	for {
 		n, err := body.Read(buf)
@@ -190,22 +211,25 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 					break
 				}
 
-				line := bytes.TrimSpace(lineBuf[:idx])
+				line := bytes.TrimRight(lineBuf[:idx], "\r")
 				lineBuf = lineBuf[idx+1:]
 
 				if len(line) == 0 {
+					if !emitEvent() {
+						return nil
+					}
 					continue
 				}
 
-				// 解析 SSE data: 前缀
-				if bytes.HasPrefix(line, []byte("data: ")) {
-					data := line[6:]
-					if bytes.Equal(data, []byte("[DONE]")) {
-						return nil
-					}
-					if !callback(data) {
-						return nil
-					}
+				if bytes.HasPrefix(line, []byte(":")) {
+					continue
+				}
+
+				// 解析 SSE data: 前缀，支持标准多行 data 聚合
+				if bytes.HasPrefix(line, []byte("data:")) {
+					data := bytes.TrimPrefix(line, []byte("data:"))
+					data = bytes.TrimPrefix(data, []byte(" "))
+					dataLines = append(dataLines, append([]byte(nil), data...))
 				}
 			}
 		}
@@ -213,13 +237,15 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 		if err != nil {
 			if err == io.EOF {
 				if len(lineBuf) > 0 {
-					line := bytes.TrimSpace(lineBuf)
-					if bytes.HasPrefix(line, []byte("data: ")) {
-						data := line[6:]
-						if !bytes.Equal(data, []byte("[DONE]")) {
-							callback(data)
-						}
+					line := bytes.TrimRight(lineBuf, "\r")
+					if bytes.HasPrefix(line, []byte("data:")) {
+						data := bytes.TrimPrefix(line, []byte("data:"))
+						data = bytes.TrimPrefix(data, []byte(" "))
+						dataLines = append(dataLines, append([]byte(nil), data...))
 					}
+				}
+				if !emitEvent() {
+					return nil
 				}
 				return nil
 			}
